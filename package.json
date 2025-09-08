@@ -1,0 +1,37 @@
+{
+  "name": "notion-docs-mcp",
+  "version": "0.1.0",
+  "description": "MCP Server para interactuar con plantillas de documentación en Notion",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "notion-docs-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean"
+  },
+  "keywords": [
+    "mcp",
+    "notion",
+    "documentation",
+    "api"
+  ],
+  "author": "juankos0714@gmail.com",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.4.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
