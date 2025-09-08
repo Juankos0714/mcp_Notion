@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * MCP Server para interactuar con plantilla de documentación de desarrollo de software en Notion
+ * MCP Server para documentación usando Gemini 1.5 (versión gratuita)
+ * Reemplaza la funcionalidad de Notion con almacenamiento local y procesamiento con Gemini
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -15,37 +16,25 @@ import {
   ImageContent,
   EmbeddedResource,
 } from "@modelcontextprotocol/sdk/types.js";
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import axios, { AxiosInstance } from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 
-// Tipos para Notion API
-interface NotionPage {
-  object: string;
-  id: string;
-  created_time: string;
-  last_edited_time: string;
-  parent: any;
-  archived: boolean;
-  properties: any;
-  url: string;
-}
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-interface NotionBlock {
-  object: string;
+// Tipos para la documentación
+interface DocumentPage {
   id: string;
-  type: string;
-  created_time: string;
-  last_edited_time: string;
-  has_children: boolean;
-  [key: string]: any;
-}
-
-interface NotionDatabase {
-  object: string;
-  id: string;
-  title: any[];
-  description: any[];
-  properties: any;
-  url: string;
+  title: string;
+  doc_type: 'api_endpoint' | 'feature' | 'bug_report' | 'general';
+  content: DocumentationContent;
+  created_at: string;
+  updated_at: string;
+  parent_id?: string;
+  tags: string[];
 }
 
 interface DocumentationContent {
@@ -58,305 +47,383 @@ interface DocumentationContent {
   title?: string;
   severity?: string;
   steps?: string;
+  raw_content?: string;
 }
 
-class NotionDocsServer {
-  private notionToken: string | null = null;
-  private baseUrl = "https://api.notion.com/v1";
+interface GeminiResponse {
+  candidates: Array<{
+    content: {
+      parts: Array<{
+        text: string;
+      }>;
+    };
+  }>;
+}
+
+class GeminiDocsServer {
+  private geminiApiKey: string | null = null;
+  private baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+  private dataDir: string;
+  private docsFile: string;
   private client: AxiosInstance;
 
   constructor() {
+    this.dataDir = path.join(__dirname, '..', 'data');
+    this.docsFile = path.join(this.dataDir, 'documentation.json');
+    
+    // Crear directorio de datos si no existe
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true });
+    }
+
+    // Inicializar archivo de documentación si no existe
+    if (!fs.existsSync(this.docsFile)) {
+      fs.writeFileSync(this.docsFile, JSON.stringify([], null, 2));
+    }
+
     this.client = axios.create({
-      baseURL: this.baseUrl,
-      headers: {
-        'Notion-Version': '2022-06-28',
-        'Content-Type': 'application/json'
-      }
+      timeout: 30000,
     });
   }
 
-  setupNotionAuth(token: string): void {
-    this.notionToken = token;
-    this.client.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+  setupGeminiAuth(apiKey: string): void {
+    this.geminiApiKey = apiKey;
   }
 
-  private async makeRequest<T = any>(
-    method: 'GET' | 'POST' | 'PATCH',
-    endpoint: string,
-    data?: any
-  ): Promise<T> {
+  private async callGemini(prompt: string): Promise<string> {
+    if (!this.geminiApiKey) {
+      throw new Error('API key de Gemini no configurado');
+    }
+
     try {
-      let response: AxiosResponse<T>;
+      const response = await this.client.post<GeminiResponse>(
+        `${this.baseUrl}?key=${this.geminiApiKey}`,
+        {
+          contents: [{
+            parts: [{
+              text: prompt
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 2048,
+          }
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          }
+        }
+      );
 
-      switch (method) {
-        case 'GET':
-          response = await this.client.get(endpoint, { params: data });
-          break;
-        case 'POST':
-          response = await this.client.post(endpoint, data);
-          break;
-        case 'PATCH':
-          response = await this.client.patch(endpoint, data);
-          break;
-        default:
-          throw new Error(`Método HTTP no soportado: ${method}`);
+      if (response.data.candidates && response.data.candidates[0]?.content?.parts[0]?.text) {
+        return response.data.candidates[0].content.parts[0].text;
+      } else {
+        throw new Error('Respuesta inválida de Gemini API');
       }
-
-      return response.data;
     } catch (error: any) {
-      if (error.response) {
-        console.error(`Error HTTP ${error.response.status}:`, error.response.data);
-        throw new Error(`Notion API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-      }
-      console.error('Error en petición a Notion:', error.message);
+      console.error('Error calling Gemini:', error.response?.data || error.message);
+      throw new Error(`Error de Gemini API: ${error.response?.data?.error?.message || error.message}`);
+    }
+  }
+
+  private loadDocuments(): DocumentPage[] {
+    try {
+      const data = fs.readFileSync(this.docsFile, 'utf-8');
+      return JSON.parse(data);
+    } catch (error) {
+      console.error('Error loading documents:', error);
+      return [];
+    }
+  }
+
+  private saveDocuments(docs: DocumentPage[]): void {
+    try {
+      fs.writeFileSync(this.docsFile, JSON.stringify(docs, null, 2));
+    } catch (error) {
+      console.error('Error saving documents:', error);
       throw error;
     }
   }
 
-  async searchPages(query: string = "", filterType: string = "page"): Promise<NotionPage[]> {
-    const searchData = {
-      query,
-      filter: {
-        value: filterType,
-        property: "object"
-      }
-    };
-
-    const result = await this.makeRequest<{ results: NotionPage[] }>('POST', '/search', searchData);
-    return result.results || [];
+  private generateId(): string {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2);
   }
 
-  async getPage(pageId: string): Promise<NotionPage> {
-    return await this.makeRequest<NotionPage>('GET', `/pages/${pageId}`);
-  }
+  async searchDocumentation(query: string, filterType?: string): Promise<DocumentPage[]> {
+    const docs = this.loadDocuments();
+    
+    if (!query) {
+      return filterType ? docs.filter(doc => doc.doc_type === filterType) : docs;
+    }
 
-  async getPageContent(pageId: string): Promise<NotionBlock[]> {
-    const result = await this.makeRequest<{ results: NotionBlock[] }>('GET', `/blocks/${pageId}/children`);
-    return result.results || [];
-  }
+    // Búsqueda simple por texto
+    const queryLower = query.toLowerCase();
+    const results = docs.filter(doc => {
+      const searchText = `${doc.title} ${doc.content.description || ''} ${doc.content.name || ''} ${doc.content.title || ''}`.toLowerCase();
+      const matchesQuery = searchText.includes(queryLower);
+      const matchesType = !filterType || doc.doc_type === filterType;
+      return matchesQuery && matchesType;
+    });
 
-  async createPage(
-    parentId: string,
-    title: string,
-    properties?: any,
-    content?: any[]
-  ): Promise<NotionPage> {
-    const pageData: any = {
-      parent: { page_id: parentId },
-      properties: {
-        title: {
-          title: [
-            {
-              text: {
-                content: title
-              }
-            }
-          ]
+    // Si tenemos Gemini configurado, mejoramos la búsqueda
+    if (this.geminiApiKey && results.length === 0 && docs.length > 0) {
+      try {
+        const prompt = `
+Analiza la siguiente consulta de búsqueda: "${query}"
+
+Documentos disponibles:
+${docs.map(doc => `- ${doc.title}: ${doc.content.description || 'Sin descripción'}`).join('\n')}
+
+Devuelve SOLO los IDs de los documentos más relevantes separados por comas, o "ninguno" si no hay coincidencias relevantes:
+`;
+
+        const response = await this.callGemini(prompt);
+        const relevantIds = response.trim().split(',').map(id => id.trim());
+        
+        if (relevantIds[0] !== 'ninguno') {
+          return docs.filter(doc => relevantIds.includes(doc.id));
         }
+      } catch (error) {
+        console.error('Error en búsqueda con Gemini:', error);
       }
+    }
+
+    return results;
+  }
+
+  async getPageDetails(pageId: string): Promise<DocumentPage | null> {
+    const docs = this.loadDocuments();
+    return docs.find(doc => doc.id === pageId) || null;
+  }
+
+  async createDocumentationPage(
+    parentId: string | undefined,
+    title: string,
+    docType: 'api_endpoint' | 'feature' | 'bug_report' | 'general',
+    content: DocumentationContent = {}
+  ): Promise<DocumentPage> {
+    const docs = this.loadDocuments();
+    
+    const newDoc: DocumentPage = {
+      id: this.generateId(),
+      title,
+      doc_type: docType,
+      content,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      parent_id: parentId,
+      tags: []
     };
 
-    if (properties) {
-      pageData.properties = { ...pageData.properties, ...properties };
+    // Si tenemos Gemini, mejoramos el contenido automáticamente
+    if (this.geminiApiKey) {
+      try {
+        const prompt = this.createDocumentationPrompt(docType, title, content);
+        const enhancedContent = await this.callGemini(prompt);
+        
+        // Parsear la respuesta de Gemini para extraer campos estructurados
+        newDoc.content = this.parseGeminiDocumentationResponse(enhancedContent, docType);
+      } catch (error) {
+        console.error('Error mejorando contenido con Gemini:', error);
+      }
     }
 
-    if (content) {
-      pageData.children = content;
-    }
-
-    return await this.makeRequest<NotionPage>('POST', '/pages', pageData);
+    docs.push(newDoc);
+    this.saveDocuments(docs);
+    
+    return newDoc;
   }
 
-  async updatePage(pageId: string, properties: any): Promise<NotionPage> {
-    const updateData = { properties };
-    return await this.makeRequest<NotionPage>('PATCH', `/pages/${pageId}`, updateData);
-  }
+  private createDocumentationPrompt(docType: string, title: string, content: DocumentationContent): string {
+    const basePrompt = `Crea documentación detallada para: "${title}"
+Tipo: ${docType}
+Contenido existente: ${JSON.stringify(content, null, 2)}
 
-  async addBlocksToPage(pageId: string, blocks: any[]): Promise<any> {
-    const blocksData = { children: blocks };
-    return await this.makeRequest('PATCH', `/blocks/${pageId}/children`, blocksData);
-  }
-
-  async queryDatabase(
-    databaseId: string,
-    filters?: any,
-    sorts?: any[]
-  ): Promise<NotionPage[]> {
-    const queryData: any = {};
-
-    if (filters) {
-      queryData.filter = filters;
-    }
-
-    if (sorts) {
-      queryData.sorts = sorts;
-    }
-
-    const result = await this.makeRequest<{ results: NotionPage[] }>('POST', `/databases/${databaseId}/query`, queryData);
-    return result.results || [];
-  }
-
-  createDocumentationBlocks(docType: string, content: DocumentationContent): any[] {
-    const blocks: any[] = [];
+Devuelve la respuesta en formato JSON con la siguiente estructura:`;
 
     switch (docType) {
-      case "api_endpoint":
-        blocks.push(
-          {
-            object: "block",
-            type: "heading_2",
-            heading_2: {
-              rich_text: [{ type: "text", text: { content: `API Endpoint: ${content.endpoint || ''}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Método: ${content.method || 'GET'}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Descripción: ${content.description || ''}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "code",
-            code: {
-              caption: [],
-              rich_text: [{ type: "text", text: { content: content.example || '' } }],
-              language: "json"
-            }
-          }
-        );
-        break;
+      case 'api_endpoint':
+        return `${basePrompt}
+{
+  "endpoint": "ruta del endpoint",
+  "method": "método HTTP",
+  "description": "descripción detallada del endpoint",
+  "example": "ejemplo de respuesta JSON",
+  "parameters": "parámetros requeridos",
+  "responses": "códigos de respuesta posibles"
+}`;
 
-      case "feature":
-        blocks.push(
-          {
-            object: "block",
-            type: "heading_2",
-            heading_2: {
-              rich_text: [{ type: "text", text: { content: `Feature: ${content.name || ''}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Estado: ${content.status || 'En desarrollo'}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: content.description || '' } }]
-            }
-          }
-        );
-        break;
+      case 'feature':
+        return `${basePrompt}
+{
+  "name": "nombre de la característica",
+  "status": "estado actual",
+  "description": "descripción completa de la característica",
+  "requirements": "requisitos técnicos",
+  "implementation_notes": "notas de implementación"
+}`;
 
-      case "bug_report":
-        blocks.push(
-          {
-            object: "block",
-            type: "heading_2",
-            heading_2: {
-              rich_text: [{ type: "text", text: { content: `Bug Report: ${content.title || ''}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Severidad: ${content.severity || 'Media'}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Descripción: ${content.description || ''}` } }]
-            }
-          },
-          {
-            object: "block",
-            type: "paragraph",
-            paragraph: {
-              rich_text: [{ type: "text", text: { content: `Pasos para reproducir: ${content.steps || ''}` } }]
-            }
-          }
-        );
-        break;
+      case 'bug_report':
+        return `${basePrompt}
+{
+  "title": "título del bug",
+  "severity": "nivel de severidad",
+  "description": "descripción del problema",
+  "steps": "pasos para reproducir",
+  "expected_behavior": "comportamiento esperado",
+  "actual_behavior": "comportamiento actual"
+}`;
 
       default:
-        blocks.push({
-          object: "block",
-          type: "paragraph",
-          paragraph: {
-            rich_text: [{ type: "text", text: { content: content.description || '' } }]
-          }
-        });
+        return `${basePrompt}
+{
+  "description": "descripción completa del documento",
+  "content": "contenido principal",
+  "notes": "notas adicionales"
+}`;
     }
-
-    return blocks;
   }
 
-  createContentBlock(contentType: string, content: string, language?: string): any {
-    switch (contentType) {
-      case "paragraph":
-        return {
-          object: "block",
-          type: "paragraph",
-          paragraph: {
-            rich_text: [{ type: "text", text: { content } }]
-          }
-        };
+  private parseGeminiDocumentationResponse(response: string, docType: string): DocumentationContent {
+    try {
+      // Intentar extraer JSON de la respuesta
+      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return { ...parsed, raw_content: response };
+      }
+    } catch (error) {
+      console.error('Error parsing Gemini response:', error);
+    }
 
-      case "heading":
-        return {
-          object: "block",
-          type: "heading_2",
-          heading_2: {
-            rich_text: [{ type: "text", text: { content } }]
-          }
-        };
+    // Si no se puede parsear, usar el contenido crudo
+    return {
+      description: response,
+      raw_content: response
+    };
+  }
 
-      case "code":
-        return {
-          object: "block",
-          type: "code",
-          code: {
-            rich_text: [{ type: "text", text: { content } }],
-            language: language || "text"
-          }
-        };
+  async updateDocumentation(pageId: string, updates: Partial<DocumentationContent>): Promise<DocumentPage | null> {
+    const docs = this.loadDocuments();
+    const docIndex = docs.findIndex(doc => doc.id === pageId);
+    
+    if (docIndex === -1) {
+      return null;
+    }
 
-      case "quote":
-        return {
-          object: "block",
-          type: "quote",
-          quote: {
-            rich_text: [{ type: "text", text: { content } }]
-          }
-        };
+    docs[docIndex].content = { ...docs[docIndex].content, ...updates };
+    docs[docIndex].updated_at = new Date().toISOString();
 
-      case "list":
-        return {
-          object: "block",
-          type: "bulleted_list_item",
-          bulleted_list_item: {
-            rich_text: [{ type: "text", text: { content } }]
-          }
-        };
+    // Si tenemos Gemini, podemos mejorar las actualizaciones
+    if (this.geminiApiKey && updates.description) {
+      try {
+        const prompt = `
+Mejora la siguiente descripción de documentación técnica:
+"${updates.description}"
 
-      default:
-        throw new Error(`Tipo de contenido no soportado: ${contentType}`);
+Tipo de documento: ${docs[docIndex].doc_type}
+Contexto existente: ${JSON.stringify(docs[docIndex].content, null, 2)}
+
+Devuelve una versión mejorada y más detallada manteniendo el formato apropiado para el tipo de documento:
+`;
+
+        const enhancedDescription = await this.callGemini(prompt);
+        docs[docIndex].content.description = enhancedDescription;
+      } catch (error) {
+        console.error('Error mejorando actualización con Gemini:', error);
+      }
+    }
+
+    this.saveDocuments(docs);
+    return docs[docIndex];
+  }
+
+  async addContentToPage(pageId: string, contentType: string, content: string): Promise<boolean> {
+    const docs = this.loadDocuments();
+    const docIndex = docs.findIndex(doc => doc.id === pageId);
+    
+    if (docIndex === -1) {
+      return false;
+    }
+
+    // Agregar el nuevo contenido al documento
+    const currentContent = docs[docIndex].content.raw_content || docs[docIndex].content.description || '';
+    const newContent = `${currentContent}\n\n## ${contentType.toUpperCase()}\n${content}`;
+    
+    docs[docIndex].content.raw_content = newContent;
+    docs[docIndex].updated_at = new Date().toISOString();
+
+    this.saveDocuments(docs);
+    return true;
+  }
+
+  async generateDocumentationSummary(): Promise<string> {
+    const docs = this.loadDocuments();
+    
+    if (!this.geminiApiKey) {
+      return `Resumen de documentación:
+- Total de documentos: ${docs.length}
+- APIs: ${docs.filter(d => d.doc_type === 'api_endpoint').length}
+- Características: ${docs.filter(d => d.doc_type === 'feature').length}
+- Reportes de bugs: ${docs.filter(d => d.doc_type === 'bug_report').length}
+- Generales: ${docs.filter(d => d.doc_type === 'general').length}`;
+    }
+
+    const prompt = `
+Genera un resumen ejecutivo de la siguiente documentación técnica:
+
+${docs.map(doc => `
+Título: ${doc.title}
+Tipo: ${doc.doc_type}
+Descripción: ${doc.content.description || 'Sin descripción'}
+Última actualización: ${doc.updated_at}
+`).join('\n---\n')}
+
+Crea un resumen ejecutivo que incluya:
+1. Estado general del proyecto
+2. APIs principales y su funcionalidad
+3. Características en desarrollo
+4. Problemas conocidos (bugs)
+5. Recomendaciones
+`;
+
+    try {
+      return await this.callGemini(prompt);
+    } catch (error) {
+      console.error('Error generando resumen:', error);
+      return 'Error al generar resumen con Gemini API';
+    }
+  }
+
+  async analyzeDocumentation(query: string): Promise<string> {
+    const docs = this.loadDocuments();
+    
+    if (!this.geminiApiKey) {
+      return 'Análisis no disponible sin API key de Gemini';
+    }
+
+    const prompt = `
+Analiza la siguiente documentación técnica basándote en la consulta: "${query}"
+
+Documentación disponible:
+${docs.map(doc => `
+ID: ${doc.id}
+Título: ${doc.title}
+Tipo: ${doc.doc_type}
+Contenido: ${JSON.stringify(doc.content, null, 2)}
+`).join('\n---\n')}
+
+Proporciona un análisis detallado que responda a la consulta específica.
+`;
+
+    try {
+      return await this.callGemini(prompt);
+    } catch (error) {
+      console.error('Error en análisis:', error);
+      return 'Error al analizar documentación con Gemini API';
     }
   }
 }
@@ -364,7 +431,7 @@ class NotionDocsServer {
 // Crear instancia del servidor MCP
 const server = new Server(
   {
-    name: "notion-docs-mcp",
+    name: "gemini-docs-mcp",
     version: "0.1.0",
   },
   {
@@ -374,40 +441,40 @@ const server = new Server(
   }
 );
 
-const notionServer = new NotionDocsServer();
+const geminiServer = new GeminiDocsServer();
 
 // Herramientas disponibles
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
-        name: "setup_notion_auth",
-        description: "Configurar token de autenticación para Notion",
+        name: "setup_gemini_auth",
+        description: "Configurar API key de Gemini 1.5 (gratuito)",
         inputSchema: {
           type: "object",
           properties: {
-            token: {
+            api_key: {
               type: "string",
-              description: "Token de integración de Notion"
+              description: "API key de Google AI Studio (Gemini)"
             }
           },
-          required: ["token"]
+          required: ["api_key"]
         }
       },
       {
         name: "search_documentation",
-        description: "Buscar páginas de documentación en Notion",
+        description: "Buscar documentación con búsqueda inteligente usando Gemini",
         inputSchema: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description: "Término de búsqueda"
+              description: "Término de búsqueda o consulta en lenguaje natural"
             },
             filter_type: {
               type: "string",
-              description: "Tipo de objeto a buscar (page, database)",
-              default: "page"
+              description: "Tipo de documento (api_endpoint, feature, bug_report, general)",
+              enum: ["api_endpoint", "feature", "bug_report", "general"]
             }
           },
           required: ["query"]
@@ -415,13 +482,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_page_details",
-        description: "Obtener detalles de una página específica",
+        description: "Obtener detalles completos de un documento",
         inputSchema: {
           type: "object",
           properties: {
             page_id: {
               type: "string",
-              description: "ID de la página de Notion"
+              description: "ID del documento"
             }
           },
           required: ["page_id"]
@@ -429,96 +496,92 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "create_documentation_page",
-        description: "Crear una nueva página de documentación",
+        description: "Crear nueva documentación con asistencia de Gemini",
         inputSchema: {
           type: "object",
           properties: {
             parent_id: {
               type: "string",
-              description: "ID de la página padre"
+              description: "ID del documento padre (opcional)"
             },
             title: {
               type: "string",
-              description: "Título de la página"
+              description: "Título del documento"
             },
             doc_type: {
               type: "string",
-              description: "Tipo de documentación (api_endpoint, feature, bug_report, general)",
+              description: "Tipo de documentación",
               enum: ["api_endpoint", "feature", "bug_report", "general"]
             },
             content: {
               type: "object",
-              description: "Contenido específico según el tipo de documentación"
+              description: "Contenido inicial (será mejorado por Gemini)"
             }
           },
-          required: ["parent_id", "title", "doc_type"]
+          required: ["title", "doc_type"]
         }
       },
       {
         name: "update_documentation",
-        description: "Actualizar una página de documentación existente",
+        description: "Actualizar documentación existente con mejoras de Gemini",
         inputSchema: {
           type: "object",
           properties: {
             page_id: {
               type: "string",
-              description: "ID de la página a actualizar"
+              description: "ID del documento a actualizar"
             },
-            properties: {
+            updates: {
               type: "object",
-              description: "Propiedades a actualizar"
+              description: "Cambios a realizar"
             }
           },
-          required: ["page_id", "properties"]
-        }
-      },
-      {
-        name: "query_documentation_database",
-        description: "Consultar base de datos de documentación",
-        inputSchema: {
-          type: "object",
-          properties: {
-            database_id: {
-              type: "string",
-              description: "ID de la base de datos"
-            },
-            filters: {
-              type: "object",
-              description: "Filtros para la consulta"
-            },
-            sorts: {
-              type: "array",
-              description: "Criterios de ordenamiento"
-            }
-          },
-          required: ["database_id"]
+          required: ["page_id", "updates"]
         }
       },
       {
         name: "add_content_to_page",
-        description: "Añadir contenido a una página existente",
+        description: "Añadir contenido a documento existente",
         inputSchema: {
           type: "object",
           properties: {
             page_id: {
               type: "string",
-              description: "ID de la página"
+              description: "ID del documento"
             },
             content_type: {
               type: "string",
-              description: "Tipo de contenido a añadir",
-              enum: ["paragraph", "heading", "code", "list", "quote"]
+              description: "Tipo de contenido",
+              enum: ["paragraph", "heading", "code", "list", "quote", "example"]
             },
             content: {
               type: "string",
               description: "Contenido a añadir"
-            },
-            language: {
-              type: "string",
-              description: "Lenguaje para bloques de código (opcional)"
             }
           },
           required: ["page_id", "content_type", "content"]
+        }
+      },
+      {
+        name: "generate_documentation_summary",
+        description: "Generar resumen ejecutivo de toda la documentación",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "analyze_documentation",
+        description: "Analizar documentación usando Gemini con consultas específicas",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Consulta o análisis específico a realizar"
+            }
+          },
+          required: ["query"]
         }
       }
     ]
@@ -531,122 +594,146 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case "setup_notion_auth":
-        notionServer.setupNotionAuth(args.token);
+      case "setup_gemini_auth":
+        geminiServer.setupGeminiAuth(args.api_key);
         return {
           content: [
             {
               type: "text",
-              text: "Autenticación configurada correctamente"
+              text: "✅ API key de Gemini configurado correctamente. Ya puedes usar todas las funcionalidades con IA."
             } as TextContent
           ]
         };
 
       case "search_documentation":
-        const results = await notionServer.searchPages(args.query, args.filter_type || "page");
+        const results = await geminiServer.searchDocumentation(args.query, args.filter_type);
         
-        const formattedResults = results.slice(0, 10).map(result => {
-          let title = "";
-          if (result.properties?.title?.title?.[0]?.text?.content) {
-            title = result.properties.title.title[0].text.content;
-          }
-          
-          return {
-            id: result.id,
-            title,
-            url: result.url,
-            last_edited: result.last_edited_time
-          };
-        });
-
         return {
           content: [
             {
               type: "text",
-              text: `Encontradas ${results.length} páginas:\n\n${JSON.stringify(formattedResults, null, 2)}`
+              text: `📚 Encontrados ${results.length} documentos:\n\n${
+                results.map(doc => `🔹 **${doc.title}** (${doc.doc_type})\n   📝 ${doc.content.description || 'Sin descripción'}\n   🆔 ID: ${doc.id}\n   📅 ${new Date(doc.updated_at).toLocaleDateString()}`).join('\n\n')
+              }`
             } as TextContent
           ]
         };
 
       case "get_page_details":
-        const pageInfo = await notionServer.getPage(args.page_id);
-        const pageContent = await notionServer.getPageContent(args.page_id);
+        const pageInfo = await geminiServer.getPageDetails(args.page_id);
+        
+        if (!pageInfo) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "❌ Documento no encontrado"
+              } as TextContent
+            ]
+          };
+        }
 
         return {
           content: [
             {
               type: "text",
-              text: `Información de la página:\n\n` +
-                    `ID: ${pageInfo.id}\n` +
-                    `URL: ${pageInfo.url}\n` +
-                    `Última edición: ${pageInfo.last_edited_time}\n\n` +
-                    `Contenido (${pageContent.length} bloques):\n` +
-                    JSON.stringify(pageContent, null, 2)
+              text: `📄 **Detalles del documento**\n\n` +
+                    `**Título:** ${pageInfo.title}\n` +
+                    `**Tipo:** ${pageInfo.doc_type}\n` +
+                    `**ID:** ${pageInfo.id}\n` +
+                    `**Creado:** ${new Date(pageInfo.created_at).toLocaleString()}\n` +
+                    `**Actualizado:** ${new Date(pageInfo.updated_at).toLocaleString()}\n\n` +
+                    `**Contenido:**\n${JSON.stringify(pageInfo.content, null, 2)}`
             } as TextContent
           ]
         };
 
       case "create_documentation_page":
-        const blocks = notionServer.createDocumentationBlocks(args.doc_type, args.content || {});
-        const newPage = await notionServer.createPage(args.parent_id, args.title, undefined, blocks);
+        const newPage = await geminiServer.createDocumentationPage(
+          args.parent_id,
+          args.title,
+          args.doc_type,
+          args.content || {}
+        );
 
         return {
           content: [
             {
               type: "text",
-              text: `Página de documentación creada:\n\n` +
-                    `ID: ${newPage.id}\n` +
-                    `URL: ${newPage.url}\n` +
-                    `Tipo: ${args.doc_type}`
+              text: `✅ **Documento creado exitosamente**\n\n` +
+                    `**Título:** ${newPage.title}\n` +
+                    `**Tipo:** ${newPage.doc_type}\n` +
+                    `**ID:** ${newPage.id}\n\n` +
+                    `**Contenido generado:**\n${JSON.stringify(newPage.content, null, 2)}`
             } as TextContent
           ]
         };
 
       case "update_documentation":
-        const updatedPage = await notionServer.updatePage(args.page_id, args.properties);
+        const updatedPage = await geminiServer.updateDocumentation(args.page_id, args.updates);
+
+        if (!updatedPage) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "❌ Documento no encontrado para actualizar"
+              } as TextContent
+            ]
+          };
+        }
 
         return {
           content: [
             {
               type: "text",
-              text: `Página actualizada:\n\n` +
-                    `ID: ${updatedPage.id}\n` +
-                    `Última edición: ${updatedPage.last_edited_time}`
-            } as TextContent
-          ]
-        };
-
-      case "query_documentation_database":
-        const dbResults = await notionServer.queryDatabase(
-          args.database_id,
-          args.filters,
-          args.sorts
-        );
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Resultados de la consulta (${dbResults.length} elementos):\n\n` +
-                    JSON.stringify(dbResults, null, 2)
+              text: `✅ **Documento actualizado**\n\n` +
+                    `**Título:** ${updatedPage.title}\n` +
+                    `**ID:** ${updatedPage.id}\n` +
+                    `**Última actualización:** ${new Date(updatedPage.updated_at).toLocaleString()}\n\n` +
+                    `**Nuevo contenido:**\n${JSON.stringify(updatedPage.content, null, 2)}`
             } as TextContent
           ]
         };
 
       case "add_content_to_page":
-        const block = notionServer.createContentBlock(
+        const success = await geminiServer.addContentToPage(
+          args.page_id,
           args.content_type,
-          args.content,
-          args.language
+          args.content
         );
-
-        await notionServer.addBlocksToPage(args.page_id, [block]);
 
         return {
           content: [
             {
               type: "text",
-              text: `Contenido añadido a la página ${args.page_id}`
+              text: success ? 
+                `✅ Contenido añadido al documento ${args.page_id}` :
+                `❌ Error: Documento ${args.page_id} no encontrado`
+            } as TextContent
+          ]
+        };
+
+      case "generate_documentation_summary":
+        const summary = await geminiServer.generateDocumentationSummary();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `📊 **Resumen de Documentación**\n\n${summary}`
+            } as TextContent
+          ]
+        };
+
+      case "analyze_documentation":
+        const analysis = await geminiServer.analyzeDocumentation(args.query);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🔍 **Análisis de Documentación**\n\n${analysis}`
             } as TextContent
           ]
         };
@@ -656,7 +743,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Herramienta desconocida: ${name}`
+              text: `❌ Herramienta desconocida: ${name}`
             } as TextContent
           ]
         };
@@ -666,7 +753,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: `Error: ${error.message}`
+          text: `❌ **Error:** ${error.message}`
         } as TextContent
       ]
     };
@@ -676,10 +763,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Notion Documentation MCP Server ejecutándose en stdio");
+  console.error("🚀 Gemini Documentation MCP Server ejecutándose en stdio");
 }
 
 main().catch((error) => {
-  console.error("Error fatal:", error);
+  console.error("💥 Error fatal:", error);
   process.exit(1);
 });
